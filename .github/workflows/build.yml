@@ -1,0 +1,119 @@
+name: Build & Publish
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        flavor: [vanilla, dd]
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: "21"
+          distribution: "graalvm-community"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build and test (vanilla only)
+        if: matrix.flavor == 'vanilla'
+        run: ./gradlew --build-cache build
+
+      - name: Compute image tag
+        id: meta
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          if [ "${{ matrix.flavor }}" = "dd" ]; then
+            echo "tag=dev-${SHORT_SHA}-dd" >> "$GITHUB_OUTPUT"
+            echo "gradle_task=optimizedDockerBuildNativeDatadog" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=dev-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+            echo "gradle_task=optimizedDockerBuildNative" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build native Docker image
+        run: ./gradlew --build-cache ${{ steps.meta.outputs.gradle_task }}
+
+      - name: Push image with SHA tag
+        if: github.event_name == 'push'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+
+  tag:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    outputs:
+      new_tag: ${{ steps.tag.outputs.new_tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bump version and create tag
+        id: tag
+        uses: anothrNick/github-tag-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BUMP: patch
+          TAG_PREFIX: v
+
+  publish:
+    needs: [test, tag]
+    if: needs.tag.outputs.new_tag != ''
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        flavor: [vanilla, dd]
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute source and destination tags
+        id: tags
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          if [ "${{ matrix.flavor }}" = "dd" ]; then
+            SUFFIX="-dd"
+          else
+            SUFFIX=""
+          fi
+          echo "src=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev-${SHORT_SHA}${SUFFIX}" >> "$GITHUB_OUTPUT"
+          echo "dst=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.tag.outputs.new_tag }}${SUFFIX}" >> "$GITHUB_OUTPUT"
+
+      - name: Pull, retag, and push
+        run: |
+          docker pull ${{ steps.tags.outputs.src }}
+          docker tag ${{ steps.tags.outputs.src }} ${{ steps.tags.outputs.dst }}
+          docker push ${{ steps.tags.outputs.dst }}
